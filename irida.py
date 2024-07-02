@@ -17,15 +17,15 @@ import os, sys
 @click.command()
 @click.option('--pid', default=None, help='Project ID')
 @click.option('--name', default=None, help='Project Name')
-@click.option('--pe/--se', default=True, help='Paired-End reads?')
+@click.option('--pe/--se', default=False, help='Paired-End reads?')
 @click.option('--sort/--no-sort', default=False, help='Sort samples [Experiment]')
 @click.option('--pattern', default='*_R1_001.fastq.gz', help='Path to fastq files')
-@click.option('--config', default='config.conf', help='Path to IRIDA config file')
+@click.option('--config', default=pathlib.Path(__file__).parent.joinpath('config.conf'), help='Path to IRIDA config file')
 @click.argument('path', default=os.getcwd())
 def prepare(path, pattern, pid, name, pe, sort, config):
     """
     Prepare for uploading a folder of fastq files to IRIDA \n
-    - Create project on IRIDA given the user credentials \n
+    - Create project on IRIDA \n
     - Generate a sample list inside the folder  
     """
     # :param sort: Sorting sample in numeric order
@@ -47,17 +47,20 @@ def prepare(path, pattern, pid, name, pe, sort, config):
             # if len(run_date) == 0:
                 run_date = datetime.date.today().strftime("%y%m%d")
             project_name = f'QIB-{p.parts[-1].replace("_","-")}-{run_date}'
-#	    logging.info(f"Project name is: {project_name}")
+            logging.info(f"Project name is: {project_name}")
         else:
             project_name = name
         
-        pid = create_project(name = project_name, config_file = config)
+        pid = create_project(name=project_name, config_file=config)
     if pe:
-        regex = re.compile('_S[0-9]{1,3}|_R[12].')
+        regex = re.compile('_S[0-9]{1,3}|_R[12].|_1.non_host.fastq.gz|_2.non_host.fastq.gz')
     else:
         regex = re.compile(".fastq|.fq.")
-    
+    if not pe:
+        pattern = "*.fastq.gz"
+
     fastqs = p.rglob(pattern)
+    print(fastqs)
     fastq_names = [fq.name for fq in fastqs]
     _sorted_fastq_names = fastq_names
     # Sort sample
@@ -70,10 +73,16 @@ def prepare(path, pattern, pid, name, pe, sort, config):
     with sample_file.open(mode='w') as fh:
         fh.write('[Data]\n')
         fh.write("Sample_Name,Project_ID,File_Forward,File_Reverse\n")
-        reverse_reads = ""
         for i in range(0, len(_sorted_fastq_names)):
             if pe:
-                reverse_reads = _sorted_fastq_names[i].replace("_R1", "_R2")
+                if "_R1_" in _sorted_fastq_names[i]:
+                    reverse_reads = _sorted_fastq_names[i].replace("_R1_", "_R2_")
+                elif "_R1.non_host.fastq.gz" in _sorted_fastq_names[i]:
+                    reverse_reads = _sorted_fastq_names[i].replace("_R1.non_host.fastq.gz", "_R2.non_host.fastq.gz")
+                else:
+                    raise ValueError(f"Invalid file name: {_sorted_fastq_names[i]}")
+            else:
+                reverse_reads = ""
             fh.write(f"{sample_ids[i]}, {pid}, {_sorted_fastq_names[i]}, {reverse_reads}\n")
     print("Finish!")
 
@@ -82,14 +91,21 @@ def prepare(path, pattern, pid, name, pe, sort, config):
 # @click.option('--config_file', default='config.conf', help='Config file')
 # @click.argument('name')
 # @click.argument('path', default=os.getcwd())
-def create_project(name, config_file, project_description = None):
+def create_project(name, config_file, project_description=None):
     """
-    Create a project
-    argument:\n
-        name: project name\n
-        project_description: project description\n
-        config_file: IRIDA config file\n
-    return project id
+    Create a project in IRIDA.
+
+    Args:
+        name (str): The name of the project.
+        config_file (str): The path to the configuration file.
+        project_description (str, optional): The description of the project. If not provided, a default description
+            will be used.
+
+    Returns:
+        int: The identifier of the created project.
+
+    Raises:
+        Exception: If an error occurs during project creation.
     """
     _config.set_config_file(config_file)
     _config.setup()
@@ -98,48 +114,73 @@ def create_project(name, config_file, project_description = None):
     try:
         _api = api_handler.initialize_api_from_config()
         projects_list = _api.get_projects()
-        existed_project = [prj.id for prj in projects_list if prj.name==name]
+        existed_project = [prj.id for prj in projects_list if prj.name == name]
         if len(existed_project) == 0:
             new_project = Project(name, project_description)
             created_project = _api.send_project(new_project)
             logging.info(f"Created project {name} - {created_project['resource']['identifier']}")
             project_id = created_project['resource']['identifier']
-            return(project_id)
+            return project_id
         else:
             logging.warning(f"Project(s) {name} is existed")
             logging.info(existed_project)
-            return(existed_project[0])
+            return existed_project[0]
     except Exception as e:
-        raise(e)
+        raise e
 
 
-def _upload(run_directory, force_upload, upload_assemblies):
+def _upload(run_directory, force_upload, upload_mode, continue_upload):
     """
-    start upload on a single run directory
-    :param run_directory:
-    :param force_upload:
-    :param upload_assemblies
-    :return: exit code 0 or 1
+    Uploads a run directory to IRIDA.
+
+    Args:
+        run_directory (str): The path to the run directory.
+        force_upload (bool): Whether to force the upload even if the run has already been uploaded.
+        upload_mode (str): The upload mode to use.
+        continue_upload (bool, optional): Whether to continue an interrupted upload. Defaults to False.
+
+    Returns:
+        int: The exit code of the upload process.
     """
-    return core.cli_entry.upload_run_single_entry(run_directory, force_upload, upload_assemblies).exit_code
+    return core.upload.upload_run_single_entry(run_directory, force_upload, upload_mode, continue_upload).exit_code
 
 
-def _upload_batch(batch_directory, force_upload, upload_assemblies):
+def _upload_batch(batch_directory, force_upload, upload_mode, continue_upload):
     """
-    Start uploading runs in the batch directory
-    :param batch_directory:
-    :param force_upload:
-    :param upload_assemblies
-    :return: exit code 0 or 1
+    Uploads a batch of folders to IRIDA.
+
+    Args:
+        batch_directory (str): The directory containing the batch of folders to upload.
+        force_upload (bool): Flag indicating whether to force the upload, even if the files already exist in IRIDA.
+        upload_mode (str): The upload mode to use. Possible values are 'create', 'update', or 'skip'.
+        continue_upload (bool): Flag indicating whether to continue an interrupted upload.
+
+    Returns:
+        int: The exit code of the upload process.
     """
-    return core.cli_entry.batch_upload_single_entry(batch_directory, force_upload, upload_assemblies).exit_code
+    return core.upload.batch_upload_single_entry(
+        batch_directory, force_upload, upload_mode, continue_upload
+    ).exit_code
 
 @click.command()
 @click.option('--force-upload', 'force_upload', is_flag=True, default=False, help="Force upload")
-@click.option('--assemblies', 'upload_assemblies', is_flag=True, default=False, help="Upload assemblies")
-@click.option('--config', default='config.conf', help='Path to IRIDA config file')
+@click.option(
+    "--continue-upload",
+    "continue_upload",
+    is_flag=True,
+    default=False,
+    help="Start uploading from where the last upload left off.",
+)
+@click.option(
+    "--upload_mode",
+    "upload_mode",
+    type=click.Choice(["default", "assemblies", "fast5"]),
+    default="default",
+    help="Upload mode (default: default)",
+)
+@click.option('--config', default=pathlib.Path(__file__).parent.joinpath('config.conf'), help='Path to IRIDA config file')
 @click.argument('directory', default=os.getcwd())
-def upload(directory, force_upload, upload_assemblies, config):
+def upload(force_upload, upload_mode, continue_upload, config):
     """
     Upload a run folder to IRIDA
     """
@@ -149,7 +190,7 @@ def upload(directory, force_upload, upload_assemblies, config):
     logging.info(f'Current directory: {directory}')
     _config.set_config_file(config)
     _config.setup()
-    _upload(directory, force_upload,upload_assemblies)
+    _upload(directory, force_upload, upload_mode, continue_upload)
 
 @click.group()
 def irida():
