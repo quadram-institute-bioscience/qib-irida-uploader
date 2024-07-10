@@ -11,8 +11,10 @@ from iridauploader.model import Project
 from iridauploader.core import api_handler
 import logging
 import datetime
-import os, sys
-
+import os
+import sys
+import configparser
+import typer
 
 @click.command()
 @click.option('--pid', default=None, help='Project ID')
@@ -85,6 +87,58 @@ def prepare(path, pattern, pid, name, pe, sort, config):
                 reverse_reads = ""
             fh.write(f"{sample_ids[i]}, {pid}, {_sorted_fastq_names[i]}, {reverse_reads}\n")
     print("Finish!")
+
+
+def initialize_irida_api(config_file: str = None):
+    """
+    Initialize the IRIDA API from the configuration file or environment variables.
+    If the configuration file is not provided or incomplete, use environment variables.
+    If environment variables are missing, prompt the user to fill in the missing fields.
+    :param config_file: Path to the configuration file (optional)
+    :return: IRIDA API instance
+    """
+    config = configparser.ConfigParser()
+    if config_file:
+        config.read(config_file)
+
+    key_list = ["base_url", "client_id", "client_secret", "username", "password"]
+    settings = {}
+
+    for key in key_list:
+        # Try to get value from config file
+        if config_file and "Settings" in config and key in config["Settings"]:
+            settings[key] = config["Settings"][key]
+        else:
+            # Try to get value from environment variable
+            env_key = f"IRIDA_{key.upper()}"
+            settings[key] = os.environ.get(env_key)
+
+        # If still not set, prompt user
+        if not settings[key]:
+            logging.warning(f"Missing {key}. Prompting user for input.")
+            _hide_input = key == "password"
+            settings[key] = typer.prompt(
+                f"Enter value for {key}", hide_input=_hide_input
+            )
+
+    logging.info(
+        f"Settings: {', '.join(f'{k}={v if k != "password" else "*****"}' for k, v in settings.items())}"
+    )
+
+    _api = api_handler._initialize_api(
+        base_url=settings["base_url"],
+        client_id=settings["client_id"],
+        client_secret=settings["client_secret"],
+        username=settings["username"],
+        password=settings["password"],
+    )
+
+    if config_file:
+        _config.set_config_file(config_file)
+        _config.setup()
+
+    return _api
+
 
 # @click.command()
 # @click.option('--project_description', help='Project description')
@@ -180,13 +234,20 @@ def _upload_batch(batch_directory, force_upload, upload_mode, continue_upload):
 )
 @click.option('--config', default=pathlib.Path(__file__).parent.joinpath('config.conf'), help='Path to IRIDA config file')
 @click.argument('directory', default=os.getcwd())
-def upload(force_upload, upload_mode, continue_upload, config):
+def upload(directory, force_upload, upload_mode, continue_upload, config):
     """
     Upload a run folder to IRIDA
     """
-    if not os.access(directory, os.W_OK):  # Cannot access upload directory
-        print("ERROR! Specified directory is not writable: {}".format(directory))
-        sys.exit(1)
+    sample_list = os.path.join(directory, 'SampleList.csv')
+    assert os.path.exists(sample_list), f"ERROR! SampleList.csv not found in {directory}"
+    assert os.access(
+        sample_list, os.W_OK
+    ), f"ERROR! Specified directory is not writable: {directory}"
+    
+    # if not os.access(directory, os.W_OK):  # Cannot access upload directory
+    #     print("ERROR! Specified directory is not writable: {}".format(directory))
+    #     sys.exit(1)
+    
     logging.info(f'Current directory: {directory}')
     _config.set_config_file(config)
     _config.setup()
