@@ -4,140 +4,79 @@ import click
 import re
 import iridauploader.config as _config
 import iridauploader.core as core
-from iridauploader.model import project
-from iridauploader.parsers import supported_parsers
-from iridauploader.parsers import directory
 from iridauploader.model import Project
 from iridauploader.core import api_handler
 import logging
 import datetime
 import os
-import sys
 import configparser
-import typer
+import tempfile
+import atexit
 
-@click.command()
-@click.option('--pid', default=None, help='Project ID')
-@click.option('--name', default=None, help='Project Name')
-@click.option('--pe/--se', default=False, help='Paired-End reads?')
-@click.option('--sort/--no-sort', default=False, help='Sort samples [Experiment]')
-@click.option('--pattern', default='*_R1_001.fastq.gz', help='Path to fastq files')
-@click.option('--config', default=pathlib.Path(__file__).parent.joinpath('config.conf'), help='Path to IRIDA config file')
-@click.argument('path', default=os.getcwd())
-def prepare(path, pattern, pid, name, pe, sort, config):
-    """
-    Prepare for uploading a folder of fastq files to IRIDA \n
-    - Create project on IRIDA \n
-    - Generate a sample list inside the folder  
-    """
-    # :param sort: Sorting sample in numeric order
-    # :param path: path to the folder of fastq files
-    # :param pattern: pattern to scan, by default: *_R1_001.fastq.gz
-    # :param pid: IRIDA project ID, you need to manually create in IRIDA control management
-    # :param pe: Are the reads paired-end?
-    # :return: A csv file SampleList.csv
 
-    p = pathlib.Path(path)
-    
-    if pid is None:
-        if name is None:
-            run_date = re.search('[0-9]{6}(?=\_NB)', path)
-            if run_date is not None:
-                run_date = run_date.group()
-            else:
-            #     sys.exit("I could not find an expected folder name for IRIDA. Please name it manually")
-            # if len(run_date) == 0:
-                run_date = datetime.date.today().strftime("%y%m%d")
-            project_name = f'QIB-{p.parts[-1].replace("_","-")}-{run_date}'
-            logging.info(f"Project name is: {project_name}")
-        else:
-            project_name = name
-        
-        pid = create_project(name=project_name, config_file=config)
-    if pe:
-        regex = re.compile('_S[0-9]{1,3}|_R[12].|_1.non_host.fastq.gz|_2.non_host.fastq.gz')
-    else:
-        regex = re.compile(".fastq|.fq.")
-    if not pe:
-        pattern = "*.fastq.gz"
-
-    fastqs = p.rglob(pattern)
-    print(fastqs)
-    fastq_names = [fq.name for fq in fastqs]
-    _sorted_fastq_names = fastq_names
-    # Sort sample
-    if sort:
-        _sorted_fastq_names = sorted(fastq_names, key=lambda s: int(regex.split(s)[0].split("_")[-1]))
-    
-    sample_ids = [regex.split(sp)[0] for sp in _sorted_fastq_names]
-    sample_file = p.joinpath('SampleList.csv')
-    # print(sorted(fastq_names, key=lambda s: int(regex.split(s)[0].split("_")[-1])))
-    with sample_file.open(mode='w') as fh:
-        fh.write('[Data]\n')
-        fh.write("Sample_Name,Project_ID,File_Forward,File_Reverse\n")
-        for i in range(0, len(_sorted_fastq_names)):
-            if pe:
-                if "_R1_" in _sorted_fastq_names[i]:
-                    reverse_reads = _sorted_fastq_names[i].replace("_R1_", "_R2_")
-                elif "_R1.non_host.fastq.gz" in _sorted_fastq_names[i]:
-                    reverse_reads = _sorted_fastq_names[i].replace("_R1.non_host.fastq.gz", "_R2.non_host.fastq.gz")
-                else:
-                    raise ValueError(f"Invalid file name: {_sorted_fastq_names[i]}")
-            else:
-                reverse_reads = ""
-            fh.write(f"{sample_ids[i]}, {pid}, {_sorted_fastq_names[i]}, {reverse_reads}\n")
-    print("Finish!")
-
+def get_config_value(config, section, key, env_var, prompt_msg, hide_input=False):
+    """Helper function to get a config value from file, env, or prompt."""
+    if section in config and key in config[section]:
+        return config[section][key]
+    value = os.environ.get(env_var)
+    if not value:
+        value = click.prompt(prompt_msg, hide_input=hide_input)
+    return value
 
 def initialize_irida_api(config_file: str = None):
     """
-    Initialize the IRIDA API from the configuration file or environment variables.
-    If the configuration file is not provided or incomplete, use environment variables.
-    If environment variables are missing, prompt the user to fill in the missing fields.
-    :param config_file: Path to the configuration file (optional)
-    :return: IRIDA API instance
+    Initialize the IRIDA API from the configuration file, environment variables, or interactive prompt.
+    Returns the API instance and the path to the temporary config file.
     """
     config = configparser.ConfigParser()
-    if config_file:
+    if config_file and os.path.exists(config_file):
         config.read(config_file)
 
-    key_list = ["base_url", "client_id", "client_secret", "username", "password"]
-    settings = {}
+    settings = {
+        "base_url": get_config_value(
+            config, "Settings", "base_url", "IRIDA_BASE_URL", "Enter IRIDA base URL"
+        ),
+        "client_id": get_config_value(
+            config, "Settings", "client_id", "IRIDA_CLIENT_ID", "Enter IRIDA client ID"
+        ),
+        "client_secret": get_config_value(
+            config,
+            "Settings",
+            "client_secret",
+            "IRIDA_CLIENT_SECRET",
+            "Enter IRIDA client secret",
+            hide_input=True,
+        ),
+        "username": get_config_value(
+            config, "Settings", "username", "IRIDA_USERNAME", "Enter IRIDA username"
+        ),
+        "password": get_config_value(
+            config,
+            "Settings",
+            "password",
+            "IRIDA_PASSWORD",
+            "Enter IRIDA password",
+            hide_input=True,
+        ),
+        "timeout_multiplier": get_config_value(
+            config, "Settings", "timeout", "IRIDA_TIMEOUT", "Enter API timeout"
+        ),
+    }
 
-    for key in key_list:
-        # Try to get value from config file
-        if config_file and "Settings" in config and key in config["Settings"]:
-            settings[key] = config["Settings"][key]
-        else:
-            # Try to get value from environment variable
-            env_key = f"IRIDA_{key.upper()}"
-            settings[key] = os.environ.get(env_key)
+    _api = api_handler._initialize_api(**settings)
 
-        # If still not set, prompt user
-        if not settings[key]:
-            logging.warning(f"Missing {key}. Prompting user for input.")
-            _hide_input = key == "password"
-            settings[key] = typer.prompt(
-                f"Enter value for {key}", hide_input=_hide_input
-            )
+    # Create a temporary config file
+    temp_config = tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".conf")
+    temp_config_path = temp_config.name
 
-    logging.info(
-        f"Settings: {', '.join(f'{k}={v if k != "password" else "*****"}' for k, v in settings.items())}"
-    )
+    config["Settings"] = settings
+    config.write(temp_config)
+    temp_config.close()
 
-    _api = api_handler._initialize_api(
-        base_url=settings["base_url"],
-        client_id=settings["client_id"],
-        client_secret=settings["client_secret"],
-        username=settings["username"],
-        password=settings["password"],
-    )
+    # Schedule the temporary file for deletion when the script exits
+    atexit.register(os.unlink, temp_config_path)
 
-    if config_file:
-        _config.set_config_file(config_file)
-        _config.setup()
-
-    return _api
+    return _api, temp_config_path
 
 
 # @click.command()
@@ -161,12 +100,13 @@ def create_project(name, config_file, project_description=None):
     Raises:
         Exception: If an error occurs during project creation.
     """
-    _config.set_config_file(config_file)
-    _config.setup()
+    # _config.set_config_file(config_file)
+    # _config.setup()
     if project_description is None:
         project_description = f"Created on {datetime.date.today()} by BOT"
     try:
-        _api = api_handler.initialize_api_from_config()
+        # _api = api_handler.initialize_api_from_config()
+        _api, _ = initialize_irida_api(config_file)
         projects_list = _api.get_projects()
         existed_project = [prj.id for prj in projects_list if prj.name == name]
         if len(existed_project) == 0:
@@ -182,6 +122,89 @@ def create_project(name, config_file, project_description=None):
     except Exception as e:
         raise e
 
+
+@click.command()
+@click.option("--pid", default=None, help="Project ID")
+@click.option("--name", default=None, help="Project Name")
+@click.option("--pe/--se", default=False, help="Paired-End reads?")
+@click.option("--sort/--no-sort", default=False, help="Sort samples [Experiment]")
+@click.option("--pattern", default="*_R1_001.fastq.gz", help="Path to fastq files")
+@click.option(
+    "--config",
+    default=pathlib.Path(__file__).parent.joinpath("config.conf"),
+    help="Path to IRIDA config file",
+)
+@click.argument("path", default=os.getcwd())
+def prepare(path, pattern, pid, name, pe, sort, config):
+    """
+    Prepare for uploading a folder of fastq files to IRIDA \n
+    - Create project on IRIDA \n
+    - Generate a sample list inside the folder \n
+    """
+    # :param sort: Sorting sample in numeric order
+    # :param path: path to the folder of fastq files
+    # :param pattern: pattern to scan, by default: *_R1_001.fastq.gz
+    # :param pid: IRIDA project ID, you need to manually create in IRIDA control management
+    # :param pe: Are the reads paired-end?
+    # :return: A csv file SampleList.csv
+    p = pathlib.Path(path)
+
+    if pid is None:
+        if name is None:
+            run_date = re.search("[0-9]{6}(?=\_NB)", path)
+            if run_date is not None:
+                run_date = run_date.group()
+            else:
+                #     sys.exit("I could not find an expected folder name for IRIDA. Please name it manually")
+                # if len(run_date) == 0:
+                run_date = datetime.date.today().strftime("%y%m%d")
+            project_name = f'QIB-{p.parts[-1].replace("_","-")}-{run_date}'
+            logging.info(f"Project name is: {project_name}")
+        else:
+            project_name = name
+
+        pid = create_project(name=project_name, config_file=config)
+    if pe:
+        regex = re.compile(
+            "_S[0-9]{1,3}|_R[12].|_1.non_host.fastq.gz|_2.non_host.fastq.gz"
+        )
+    else:
+        regex = re.compile(".fastq|.fq.")
+    if not pe:
+        pattern = "*.fastq.gz"
+
+    fastqs = p.rglob(pattern)
+    print(fastqs)
+    fastq_names = [fq.name for fq in fastqs]
+    _sorted_fastq_names = fastq_names
+    # Sort sample
+    if sort:
+        _sorted_fastq_names = sorted(
+            fastq_names, key=lambda s: int(regex.split(s)[0].split("_")[-1])
+        )
+
+    sample_ids = [regex.split(sp)[0] for sp in _sorted_fastq_names]
+    sample_file = p.joinpath("SampleList.csv")
+    # print(sorted(fastq_names, key=lambda s: int(regex.split(s)[0].split("_")[-1])))
+    with sample_file.open(mode="w") as fh:
+        fh.write("[Data]\n")
+        fh.write("Sample_Name,Project_ID,File_Forward,File_Reverse\n")
+        for i in range(0, len(_sorted_fastq_names)):
+            if pe:
+                if "_R1_" in _sorted_fastq_names[i]:
+                    reverse_reads = _sorted_fastq_names[i].replace("_R1_", "_R2_")
+                elif "_R1.non_host.fastq.gz" in _sorted_fastq_names[i]:
+                    reverse_reads = _sorted_fastq_names[i].replace(
+                        "_R1.non_host.fastq.gz", "_R2.non_host.fastq.gz"
+                    )
+                else:
+                    raise ValueError(f"Invalid file name: {_sorted_fastq_names[i]}")
+            else:
+                reverse_reads = ""
+            fh.write(
+                f"{sample_ids[i]}, {pid}, {_sorted_fastq_names[i]}, {reverse_reads}\n"
+            )
+    print("Finish!")
 
 def _upload(run_directory, force_upload, upload_mode, continue_upload):
     """
@@ -249,9 +272,14 @@ def upload(directory, force_upload, upload_mode, continue_upload, config):
     #     sys.exit(1)
     
     logging.info(f'Current directory: {directory}')
-    _config.set_config_file(config)
+    # Initialize API with flexible authentication and get the temporary config file path
+    api, temp_config_path = initialize_irida_api(config)
+
+    # Set up configuration using the temporary config file
+    _config.set_config_file(temp_config_path)
     _config.setup()
     _upload(directory, force_upload, upload_mode, continue_upload)
+
 
 @click.group()
 def irida():
