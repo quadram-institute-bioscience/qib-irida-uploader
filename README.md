@@ -84,6 +84,8 @@ timeout = 1500
 ```
 
 ### Environment variables
+You can export a list of environment variables like below before running the script.
+
 ```
 export IRIDA_BASE_URL=CHANGE-ME
 export IRIDA_CLIENT_ID=CHANGE-ME
@@ -92,6 +94,7 @@ export IRIDA_USERNAME=CHANGE-ME
 export IRIDA_PASSWORD=CHANGE-ME
 export IRIDA_TIMEOUT=CHANGE-ME
 ```
+
 ### Prompting
 If neither the config file nor environment variables provide all the necessary configuration parameters, the script will prompt you for any missing information. For example, if your config file only contains `base_url`, you will be asked to provide the remaining 5 parameters interactively.
 
