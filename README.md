@@ -12,7 +12,7 @@ This Python script (`irida.py`) is rather a wrapper of `iridauploader` to provid
 
 ## Prerequisites
 
-- Python 3.x
+- Python 3.10
 - Required Python packages are listed in `requirements.txt`
 
 ## Installation
